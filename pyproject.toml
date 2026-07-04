@@ -211,6 +211,7 @@ filterwarnings = [
 dev = [
     "bandit[sarif]>=1.9.3",
     "detect-secrets>=1.5.0",
+    "hypothesis>=6.156.1",
     "pip-audit>=2.10.0",
     # Pulled in transitively via pip-api -> pip-audit; pinned here to satisfy
     # Dependabot's >=26.1 advisory on the lockfile (PYSEC-2026-196 -> >=26.1.2).
