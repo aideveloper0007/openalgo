@@ -4028,3 +4028,196 @@ def log_event(kind: str, **fields: Any) -> str:
     level = logging.ERROR if "error" in str(kind).lower() else logging.INFO
     logger.log(level, message)
     return message
+
+
+# ---------------------------------------------------------------------------
+# Engine orchestration (Req 1.3, 1.4, 2.6, 6.1, 16.3)
+# ---------------------------------------------------------------------------
+#
+# ``run(config)`` is the single entry-point every thin strategy script calls
+# under ``__main__``. It performs a strict sequence:
+#
+#   1. Configure IST-timestamped logging to stdout.
+#   2. Resolve the platform environment (API key, host, ws_url) — exit non-zero
+#      on missing API key (Req 2.5).
+#   3. Validate the config — exit non-zero on any invalid field (Req 3.8, 3.9).
+#   4. Initialize the OpenAlgo SDK client with the resolved endpoints (Req 2.6).
+#   5. Log the strategy name, index, active execution mode, and entry/exit times
+#      at startup (Req 1.4, 16.3).
+#   6. Schedule the entry cron job at ``Entry_Time`` and the exit cron at
+#      ``Exit_Time`` on a ``BackgroundScheduler`` with ``Asia/Kolkata`` timezone
+#      (Req 6.1).
+#   7. Keep the process alive until exit completes or the process is terminated.
+#
+# The ``_entry_job`` callback resolves expiry, applies the execution mode, and
+# places entries; the ``_exit_job`` callback performs the scheduled exit and
+# tears down the scheduler. The monitoring loop is started after entry to run
+# risk evaluation while any legs are open.
+
+
+def _entry_job(
+    engine: EngineState,
+    scheduler: Any,
+) -> None:
+    """Cron-triggered entry callback (fires at Entry_Time IST; Req 6.1).
+
+    Resolves the weekly expiry, applies the execution-mode routing, places
+    entry orders for all non-momentum legs, and starts the monitoring loop.
+    Momentum legs are deferred to the monitoring loop (Req 9.1). On any fatal
+    error the engine is stopped and the scheduler is shut down.
+    """
+    config = engine.config
+    try:
+        engine.expiry = resolve_weekly_expiry(
+            engine.client, config.index.name, config.index.fno_exchange,
+        )
+        apply_execution_mode(engine)
+        place_entry(engine, sleep=_sleep)
+        monitor(engine, sleep=_sleep)
+    except (ConfigError, ExpiryError) as exc:
+        logger.error("%s entry failed: %s", config.strategy_name, exc)
+        engine.running = False
+    except Exception as exc:  # noqa: BLE001 - must not crash the scheduler
+        logger.error("%s entry unexpected error: %s", config.strategy_name, exc)
+        engine.running = False
+    finally:
+        finalize_exit_if_flat(engine)
+
+
+def _exit_job(
+    engine: EngineState,
+    scheduler: Any,
+) -> None:
+    """Cron-triggered exit callback (fires at Exit_Time IST; Req 15.3).
+
+    Performs the scheduled exit (squares off every open leg) and stops the
+    monitoring loop by clearing ``engine.running``. The scheduler is shut down
+    after the exit is confirmed so the process can terminate cleanly.
+    """
+    try:
+        still_open = perform_scheduled_exit(engine, sleep=_sleep)
+        while still_open:
+            _sleep(1.0)
+            still_open = perform_scheduled_exit(engine, sleep=_sleep)
+    except Exception as exc:  # noqa: BLE001 - exit must not crash
+        logger.error(
+            "%s exit unexpected error: %s", engine.config.strategy_name, exc,
+        )
+    finally:
+        engine.running = False
+        finalize_exit_if_flat(engine)
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:  # noqa: BLE001 - teardown
+            pass
+
+
+def run(config: StrategyConfig) -> None:
+    """Orchestrate a single portfolio strategy end-to-end (Req 1.3, 1.4).
+
+    This is the entry-point every thin per-strategy script calls under
+    ``__main__``. It performs environment resolution, config validation,
+    SDK client initialization, startup logging, entry/exit scheduling via
+    APScheduler with ``Asia/Kolkata`` timezone, and keeps the process alive
+    until exit completes or the process is terminated.
+
+    On missing API key the process exits non-zero (Req 2.5). On invalid config
+    the process exits non-zero without scheduling any trades (Req 3.8, 3.9).
+
+    Args:
+        config: The fully-specified ``StrategyConfig`` from the strategy script.
+    """
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    configure_logging()
+
+    # Step 1: resolve environment (Req 2)
+    try:
+        env = resolve_environment(use_websocket=config.use_websocket)
+    except ConfigError as exc:
+        logger.error("Environment resolution failed: %s", exc)
+        sys.exit(1)
+
+    # Step 2: validate config (Req 3)
+    try:
+        config = validate_config(config)
+    except ConfigError as exc:
+        logger.error("Configuration validation failed: %s", exc)
+        sys.exit(1)
+
+    # Step 3: initialize the SDK client (Req 2.6)
+    try:
+        from openalgo import api
+        client = api(
+            api_key=env.api_key,
+            host=env.host,
+        )
+    except Exception as exc:  # noqa: BLE001 - SDK init must not crash
+        logger.error("SDK client initialization failed: %s", exc)
+        sys.exit(1)
+
+    # Step 4: startup logging (Req 1.4, 16.3)
+    logger.info(
+        "Starting %s index=%s mode=%s entry=%s exit=%s lots=%d qty=%d",
+        config.strategy_name,
+        config.index.name,
+        config.execution_mode.value,
+        config.entry_time,
+        config.exit_time,
+        config.lots,
+        config.quantity,
+    )
+
+    # Step 5: build engine state
+    engine = EngineState(config=config, client=client)
+
+    # Step 6: schedule entry and exit cron jobs (Req 6.1)
+    entry_t = _parse_hms(config.entry_time, "entry_time").time()
+    exit_t = _parse_hms(config.exit_time, "exit_time").time()
+
+    scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+    scheduler.add_job(
+        _entry_job,
+        "cron",
+        args=[engine, scheduler],
+        hour=entry_t.hour,
+        minute=entry_t.minute,
+        second=entry_t.second,
+        id=f"{config.strategy_name}_entry",
+    )
+    scheduler.add_job(
+        _exit_job,
+        "cron",
+        args=[engine, scheduler],
+        hour=exit_t.hour,
+        minute=exit_t.minute,
+        second=exit_t.second,
+        id=f"{config.strategy_name}_exit",
+    )
+    scheduler.start()
+
+    logger.info(
+        "%s scheduler started (tz=Asia/Kolkata); entry=%s exit=%s. "
+        "Waiting for trading window...",
+        config.strategy_name,
+        config.entry_time,
+        config.exit_time,
+    )
+
+    # Step 7: keep the process alive until the engine stops or is terminated
+    try:
+        while engine.running:
+            _sleep(1.0)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("%s received shutdown signal.", config.strategy_name)
+    finally:
+        engine.running = False
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:  # noqa: BLE001 - teardown
+            pass
+        logger.info(
+            "%s process exiting. realized_mtm=%.2f",
+            config.strategy_name,
+            engine.realized_mtm,
+        )

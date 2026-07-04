@@ -1,0 +1,36 @@
+#!/usr/bin/env python
+"""NF3_Adjustable_Strangle: short NIFTY OTM6 CE+PE adjustable strangle.
+
+Sells CE+PE at OTM6 with UnderlyingPoints leg SL 100, no leg trail,
+Immediate re-entry ×3, overall SL 1750, overall trail 2000/2000.
+Square-off-all is true. Re-entry cutoff at 284 minutes (13:59 IST)
+(Req 19.4).
+"""
+import bjp_core as core
+
+CONFIG = core.StrategyConfig(
+    strategy_name="NF3_Adjustable_Strangle",
+    index=core.NIFTY,
+    lots=1,
+    entry_time="09:16:00",
+    exit_time="15:22:00",
+    legs=[
+        core.LegConfig(
+            core.OptionType.CE, core.Action.SELL, "OTM6",
+            stop_loss=core.LegStopLoss(core.SLKind.UNDERLYING_POINTS, 100),
+            reentry=core.LegReentry(core.ReentryKind.IMMEDIATE, 3),
+        ),
+        core.LegConfig(
+            core.OptionType.PE, core.Action.SELL, "OTM6",
+            stop_loss=core.LegStopLoss(core.SLKind.UNDERLYING_POINTS, 100),
+            reentry=core.LegReentry(core.ReentryKind.IMMEDIATE, 3),
+        ),
+    ],
+    overall_stop_loss=core.OverallStopLoss(1750),
+    overall_trail_sl=core.OverallTrailSL(2000, 2000),
+    square_off_all_legs=True,
+    reentry_time_restriction_min=284,
+)
+
+if __name__ == "__main__":
+    core.run(CONFIG)
